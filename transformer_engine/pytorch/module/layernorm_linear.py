@@ -300,6 +300,7 @@ class _LayerNormLinear(torch.autograd.Function):
         new_weight_workspace = None
         weightmat = weight
         is_weight_param_quantized = False
+        fprop_only_weightmat = False
         if fp8 or debug:
             is_weight_param_quantized = isinstance(weight, QuantizedTensorStorage)
 
@@ -316,6 +317,23 @@ class _LayerNormLinear(torch.autograd.Function):
                     rowwise=True,
                     columnwise=is_grad_enabled and not is_fsdp2 and backward_override is None,
                 )
+            restore_weight_amax = None
+            fprop_weight_amax_group = getattr(
+                weight_quantizer,
+                "_force_fprop_amax_reduction_group",
+                None,
+            )
+            if (
+                fprop_weight_amax_group is not None
+                and weight_quantizer is not None
+                and not is_weight_param_quantized
+            ):
+                restore_weight_amax = (
+                    weight_quantizer.with_amax_reduction,
+                    weight_quantizer.amax_reduction_group,
+                )
+                weight_quantizer.with_amax_reduction = True
+                weight_quantizer.amax_reduction_group = fprop_weight_amax_group
 
             # Get quantized weight
             update_ws = is_first_microbatch is None or is_first_microbatch
@@ -329,6 +347,10 @@ class _LayerNormLinear(torch.autograd.Function):
                 workspace_dtype=activation_dtype,
                 cache=cache_weight,
             )
+            if restore_weight_amax is not None:
+                weight_quantizer.with_amax_reduction = restore_weight_amax[0]
+                weight_quantizer.amax_reduction_group = restore_weight_amax[1]
+                fprop_only_weightmat = True
 
             weightmat.update_usage(rowwise_usage=True)
 
@@ -375,12 +397,13 @@ class _LayerNormLinear(torch.autograd.Function):
         # Forward GEMM
         # Note: y = x * w^T
         # ------------------------------------------------------
+        gemm_out_dtype = activation_dtype
         nvtx_range_push(f"{nvtx_label}.gemm")
         gemm_out, *_, reduce_scatter_out = general_gemm(
             weightmat,
             ln_out_total,
             quantization_params=output_quantizer,
-            out_dtype=activation_dtype,
+            out_dtype=gemm_out_dtype,
             bias=bias,
             use_split_accumulator=use_split_accumulator,
             ub=ub_obj,
@@ -420,6 +443,8 @@ class _LayerNormLinear(torch.autograd.Function):
             nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
         else:
             out = gemm_out
+        if out.dtype != activation_dtype:
+            out = out.to(dtype=activation_dtype)
         out = out.view(-1, *inp_shape[1:-1], out_features)
         # ------------------------------------------------------
         # Output tensor is ready to return...
@@ -462,7 +487,9 @@ class _LayerNormLinear(torch.autograd.Function):
                 fsdp_group,
                 mu,
                 rsigma,
-                weightmat if fp8 and not is_weight_param_quantized else None,
+                weightmat
+                if fp8 and not is_weight_param_quantized and not fprop_only_weightmat
+                else None,
                 ln_out_to_save if weight.requires_grad else None,
             )
             nvtx_range_pop(f"{nvtx_label}.fsdp_scatter")
@@ -480,6 +507,8 @@ class _LayerNormLinear(torch.autograd.Function):
             # Backward will re-quantize from FSDP2 all-gathered weight.
             # (Issue #2681)
             wt_save = weightmat
+            if fprop_only_weightmat:
+                wt_save = None
             if is_fsdp2 and weightmat is not weight:
                 wt_save = None
             tensors_to_save, tensor_objects = prepare_for_saving(
@@ -763,7 +792,23 @@ class _LayerNormLinear(torch.autograd.Function):
                     weight = saved_weight
                 elif ctx.weight_quantizer is not None:
                     ctx.weight_quantizer.set_usage(rowwise=True, columnwise=True)
+                    restore_weight_amax = None
+                    bwd_weight_amax_group = getattr(
+                        ctx.weight_quantizer,
+                        "_force_fprop_amax_reduction_group",
+                        None,
+                    )
+                    if bwd_weight_amax_group is not None:
+                        restore_weight_amax = (
+                            ctx.weight_quantizer.with_amax_reduction,
+                            ctx.weight_quantizer.amax_reduction_group,
+                        )
+                        ctx.weight_quantizer.with_amax_reduction = True
+                        ctx.weight_quantizer.amax_reduction_group = bwd_weight_amax_group
                     weight = ctx.weight_quantizer(saved_weight)
+                    if restore_weight_amax is not None:
+                        ctx.weight_quantizer.with_amax_reduction = restore_weight_amax[0]
+                        ctx.weight_quantizer.amax_reduction_group = restore_weight_amax[1]
 
             # Make sure required data is available
             if isinstance(grad_output, QuantizedTensorStorage):
@@ -1899,23 +1944,31 @@ class LayerNormLinear(TransformerEngineBaseModule):
         """Customize quantizers based on current scaling recipe + layernorm_linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
+            role = getattr(self, "_force_te_weight_amax_role", "")
+            if (
+                role in {"qkv", "attn_proj"}
+                and self.tp_size > 1
+                and self.parallel_mode in ("column", "row")
+            ):
+                weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+                weight_quantizer._force_fprop_amax_reduction_group = self.tp_group
             if self.sequence_parallel and self.parallel_mode == "column":
                 # set input_quantizer with amax reduction TP group
-                self.quantizers["scaling_fwd"][
-                    FP8FwdTensorIdx.GEMM1_INPUT
-                ].with_amax_reduction = True
-                self.quantizers["scaling_fwd"][
-                    FP8FwdTensorIdx.GEMM1_INPUT
-                ].amax_reduction_group = self.tp_group
+                input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+                if (
+                    not getattr(input_quantizer, "row_scaled_nvfp4", False)
+                    and not input_quantizer.with_amax_reduction
+                ):
+                    input_quantizer.with_amax_reduction = True
+                    input_quantizer.amax_reduction_group = self.tp_group
         else:
             if self.sequence_parallel and self.parallel_mode == "row":
                 # customize grad_output_quantizer with amax reduction TP group
-                self.quantizers["scaling_bwd"][
+                grad_output_quantizer = self.quantizers["scaling_bwd"][
                     FP8BwdTensorIdx.GRAD_OUTPUT1
-                ].with_amax_reduction = True
-                self.quantizers["scaling_bwd"][
-                    FP8BwdTensorIdx.GRAD_OUTPUT1
-                ].amax_reduction_group = self.tp_group
+                ]
+                grad_output_quantizer.with_amax_reduction = True
+                grad_output_quantizer.amax_reduction_group = self.tp_group
 
     def _get_weight_tensors(self) -> List[Union[torch.Tensor, QuantizedTensorStorage]]:
         """Get the weight tensors of the module."""

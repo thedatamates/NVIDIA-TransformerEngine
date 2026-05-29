@@ -401,6 +401,7 @@ def _linear_forward_impl(
     # ------------------------------------------------------
     new_weight_workspace = None
     weightmat = weight
+    fprop_only_weightmat = False
     if fp8 or debug:
         # Configure quantizer
         # No need to set the quantizer states if weight is already quantized
@@ -417,6 +418,23 @@ def _linear_forward_impl(
             weight_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
         elif isinstance(weight, QuantizedTensor):
             weight_quantizer = weight._quantizer
+        restore_weight_amax = None
+        fprop_weight_amax_group = getattr(
+            weight_quantizer,
+            "_force_fprop_amax_reduction_group",
+            None,
+        )
+        if (
+            fprop_weight_amax_group is not None
+            and weight_quantizer is not None
+            and not isinstance(weight, (QuantizedTensor, QuantizedTensorStorage))
+        ):
+            restore_weight_amax = (
+                weight_quantizer.with_amax_reduction,
+                weight_quantizer.amax_reduction_group,
+            )
+            weight_quantizer.with_amax_reduction = True
+            weight_quantizer.amax_reduction_group = fprop_weight_amax_group
         # Get quantized weight
         update_ws = is_first_microbatch is None or is_first_microbatch
         weightmat, new_weight_workspace = quantize_weight(
@@ -429,6 +447,10 @@ def _linear_forward_impl(
             workspace_dtype=activation_dtype,
             cache=args.cache_weight,
         )
+        if restore_weight_amax is not None:
+            weight_quantizer.with_amax_reduction = restore_weight_amax[0]
+            weight_quantizer.amax_reduction_group = restore_weight_amax[1]
+            fprop_only_weightmat = True
         weightmat.update_usage(rowwise_usage=True)
 
     else:
@@ -474,12 +496,29 @@ def _linear_forward_impl(
     # Forward GEMM
     # Note: y = x * w^T
     # ------------------------------------------------------
+    gemm_inputmat_total = inputmat_total
+    gemm_weightmat = weightmat
+    gemm_output_quantizer = output_quantizer
+    gemm_out_dtype = activation_dtype
+    if (
+        parallel_mode == "row"
+        and args.tp_size > 1
+        and gemm_output_quantizer is None
+        and bool(
+            getattr(
+                weight_quantizer,
+                "_force_row_parallel_fprop_fp32_reduce",
+                False,
+            )
+        )
+    ):
+        gemm_out_dtype = torch.float32
     nvtx_range_push(f"{nvtx_label}.gemm")
     gemm_out, *_, reduce_scatter_out = general_gemm(
-        weightmat,
-        inputmat_total,
-        quantization_params=output_quantizer,
-        out_dtype=activation_dtype,
+        gemm_weightmat,
+        gemm_inputmat_total,
+        quantization_params=gemm_output_quantizer,
+        out_dtype=gemm_out_dtype,
         bias=bias,
         use_split_accumulator=use_split_accumulator,
         ub=ub_obj,
@@ -518,6 +557,8 @@ def _linear_forward_impl(
         nvtx_range_pop(f"{nvtx_label}.row_parallel_comm")
     else:
         out = gemm_out
+    if out.dtype != activation_dtype:
+        out = out.to(dtype=activation_dtype)
     # ------------------------------------------------------
     # Output tensor is ready to return...
     # ------------------------------------------------------
@@ -562,7 +603,9 @@ def _linear_forward_impl(
         fsdp_shapes = _fsdp_scatter_tensors(
             fsdp_group,
             saved_inputmat,
-            weightmat if fp8 and not isinstance(weight, QuantizedTensorStorage) else None,
+            weightmat
+            if fp8 and not isinstance(weight, QuantizedTensorStorage) and not fprop_only_weightmat
+            else None,
         )
         nvtx_range_pop(f"{nvtx_label}.fsdp_scatter")
 
@@ -574,6 +617,8 @@ def _linear_forward_impl(
         # Backward will re-quantize from the FSDP2 all-gathered weight.
         # (Issue #2681)
         wt_save = weightmat
+        if fprop_only_weightmat:
+            wt_save = None
         if is_fsdp2 and weightmat is not weight:
             wt_save = None
 
@@ -934,7 +979,29 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
                     weight_fp8 = saved_weight
                 elif bwd_args.weight_quantizer is not None:
                     bwd_args.weight_quantizer.set_usage(rowwise=True, columnwise=True)
+                    restore_weight_amax = None
+                    bwd_weight_amax_group = getattr(
+                        bwd_args.weight_quantizer,
+                        "_force_fprop_amax_reduction_group",
+                        None,
+                    )
+                    if bwd_weight_amax_group is not None:
+                        restore_weight_amax = (
+                            bwd_args.weight_quantizer.with_amax_reduction,
+                            bwd_args.weight_quantizer.amax_reduction_group,
+                        )
+                        bwd_args.weight_quantizer.with_amax_reduction = True
+                        bwd_args.weight_quantizer.amax_reduction_group = (
+                            bwd_weight_amax_group
+                        )
                     weight_fp8 = bwd_args.weight_quantizer(saved_weight)
+                    if restore_weight_amax is not None:
+                        bwd_args.weight_quantizer.with_amax_reduction = (
+                            restore_weight_amax[0]
+                        )
+                        bwd_args.weight_quantizer.amax_reduction_group = (
+                            restore_weight_amax[1]
+                        )
 
             # Make sure required data is available
             if isinstance(grad_output, QuantizedTensorStorage):
@@ -2088,23 +2155,39 @@ class Linear(TransformerEngineBaseModule):
         """Customize quantizers based on current scaling recipe + linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
+            role = getattr(self, "_force_te_weight_amax_role", "")
+            if (
+                role in {"qkv", "attn_proj"}
+                and self.tp_size > 1
+                and self.parallel_mode in ("column", "row")
+            ):
+                weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+                weight_quantizer._force_fprop_amax_reduction_group = self.tp_group
+            if (
+                role == "attn_proj"
+                and self.tp_size > 1
+                and self.parallel_mode == "row"
+            ):
+                weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+                weight_quantizer._force_row_parallel_fprop_fp32_reduce = True
             if self.sequence_parallel and self.parallel_mode == "column":
                 # customize input_quantizer with amax reduction TP group
-                self.quantizers["scaling_fwd"][
-                    FP8FwdTensorIdx.GEMM1_INPUT
-                ].with_amax_reduction = True
-                self.quantizers["scaling_fwd"][
-                    FP8FwdTensorIdx.GEMM1_INPUT
-                ].amax_reduction_group = self.tp_group
+                input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+                if (
+                    not getattr(input_quantizer, "row_scaled_nvfp4", False)
+                    and not input_quantizer.with_amax_reduction
+                ):
+                    input_quantizer.with_amax_reduction = True
+                    input_quantizer.amax_reduction_group = self.tp_group
         else:
             if self.sequence_parallel and self.parallel_mode == "row":
                 # customize grad_output_quantizer with amax reduction TP group
-                self.quantizers["scaling_bwd"][
+                grad_output_quantizer = self.quantizers["scaling_bwd"][
                     FP8BwdTensorIdx.GRAD_OUTPUT1
-                ].with_amax_reduction = True
-                self.quantizers["scaling_bwd"][
-                    FP8BwdTensorIdx.GRAD_OUTPUT1
-                ].amax_reduction_group = self.tp_group
+                ]
+                if not grad_output_quantizer.with_amax_reduction:
+                    grad_output_quantizer.with_amax_reduction = True
+                    grad_output_quantizer.amax_reduction_group = self.tp_group
 
     def _get_weight_quantizers(self) -> List[Quantizer]:
         """Get the weight quantizers of the module."""

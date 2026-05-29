@@ -2651,21 +2651,18 @@ class LayerNormMLP(TransformerEngineBaseModule):
         if fwd:
             if self.sequence_parallel and self.set_parallel_mode:
                 # fc1_input_quantizer: customize input_quantizer with amax reduction TP group, column parallel + sequence parallel here
-                self.quantizers["scaling_fwd"][
-                    FP8FwdTensorIdx.GEMM1_INPUT
-                ].with_amax_reduction = True
-                self.quantizers["scaling_fwd"][
-                    FP8FwdTensorIdx.GEMM1_INPUT
-                ].amax_reduction_group = self.tp_group
+                input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+                if not getattr(input_quantizer, "row_scaled_nvfp4", False):
+                    input_quantizer.with_amax_reduction = True
+                    input_quantizer.amax_reduction_group = self.tp_group
         else:
             if self.sequence_parallel and self.set_parallel_mode:
                 # fc2_grad_output_quantizer: customize grad_output_quantizer with amax reduction TP group, row parallel + sequence parallel here
-                self.quantizers["scaling_bwd"][
+                grad_output_quantizer = self.quantizers["scaling_bwd"][
                     FP8BwdTensorIdx.GRAD_OUTPUT2
-                ].with_amax_reduction = True
-                self.quantizers["scaling_bwd"][
-                    FP8BwdTensorIdx.GRAD_OUTPUT2
-                ].amax_reduction_group = self.tp_group
+                ]
+                grad_output_quantizer.with_amax_reduction = True
+                grad_output_quantizer.amax_reduction_group = self.tp_group
 
     def _get_weight_tensors(self) -> List[Union[torch.Tensor, QuantizedTensorStorage]]:
         """Get the weight tensors of the module."""

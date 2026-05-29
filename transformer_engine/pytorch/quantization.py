@@ -1687,19 +1687,32 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                         nvfp4_e4m3_max = 256
                 elif self.recipe.nvfp4_4over6_e4m3_use_256 == "none":
                     nvfp4_e4m3_max = 448
+            amax_reduction_group = FP8GlobalStateManager.get_fp8_group()
+            row_scaled_nvfp4 = (
+                self.mode == "forward"
+                and tensor_type != "weight"
+                and self.recipe.row_scaled_activation
+            )
+            reduce_amax = (
+                amax_reduction_group is not None
+                and tensor_type != "weight"
+                and (
+                    not row_scaled_nvfp4
+                    or os.environ.get("NVTE_FORCE_ROW_SCALED_NVFP4_AMAX_REDUCTION")
+                    == "1"
+                )
+            )
             return NVFP4Quantizer(
                 fp4_dtype=self.dtype,
                 rowwise=True,
                 columnwise=True,
+                with_amax_reduction=reduce_amax,
+                amax_reduction_group=amax_reduction_group if reduce_amax else None,
                 with_rht=qparams.random_hadamard_transform,
                 with_post_rht_amax=qparams.random_hadamard_transform,
                 with_2d_quantization=qparams.fp4_2d_quantization,
                 stochastic_rounding=qparams.stochastic_rounding,
-                row_scaled_nvfp4=(
-                    self.mode == "forward"
-                    and tensor_type != "weight"
-                    and self.recipe.row_scaled_activation
-                ),
+                row_scaled_nvfp4=row_scaled_nvfp4,
                 nvfp4_use_4over6=nvfp4_use_4over6,
                 nvfp4_e4m3_max=nvfp4_e4m3_max,
                 nvfp4_4over6_err_mode=self.recipe.nvfp4_4over6_err_mode,
