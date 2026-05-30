@@ -413,16 +413,12 @@ class BasicLinear(BasicOperation):
                 tensor_parallel_mode = getattr(self, "tensor_parallel_mode", None)
                 if getattr(self, "sequence_parallel", False):
                     if tensor_parallel_mode == "column":
-                        if (
-                            not getattr(input_quantizer, "row_scaled_nvfp4", False)
-                            and not input_quantizer.with_amax_reduction
-                        ):
+                        if not getattr(input_quantizer, "row_scaled_nvfp4", False):
                             input_quantizer.with_amax_reduction = True
                             input_quantizer.amax_reduction_group = self.tensor_parallel_group
                     elif tensor_parallel_mode == "row":
-                        if not grad_output_quantizer.with_amax_reduction:
-                            grad_output_quantizer.with_amax_reduction = True
-                            grad_output_quantizer.amax_reduction_group = self.tensor_parallel_group
+                        grad_output_quantizer.with_amax_reduction = True
+                        grad_output_quantizer.amax_reduction_group = self.tensor_parallel_group
 
         # Update quantizer in quantized weight tensor
         if weight_quantizer is not None and is_quantized_tensor(weight):

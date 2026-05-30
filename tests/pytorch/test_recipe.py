@@ -644,6 +644,97 @@ def test_nvfp4_row_scaled_quantizer_roles(
 
 
 @pytest.mark.skipif(not fp4_available, reason=reason_for_no_fp4)
+def test_nvfp4_attention_tp_quantizer_customization():
+    from transformer_engine.pytorch.constants import FP8FwdTensorIdx
+
+    nvfp4_recipe = NVFP4BlockScaling()
+    tp_group = object()
+
+    qkv = Linear(
+        16,
+        48,
+        parallel_mode="column",
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        name="self_attention.qkv",
+    )
+    qkv.set_tensor_parallel_group(tp_group)
+    qkv.output_quantizer_role = QuantizerRole(
+        module_type="dpa",
+        tensor_type="qkv",
+        name="self_attention.core_attention",
+    )
+
+    proj = Linear(
+        16,
+        16,
+        parallel_mode="row",
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        name="self_attention.proj",
+    )
+    proj.set_tensor_parallel_group(tp_group)
+
+    ln_qkv = LayerNormLinear(
+        16,
+        48,
+        parallel_mode="column",
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        name="self_attention.layernorm_qkv",
+    )
+    ln_qkv.set_tensor_parallel_group(tp_group)
+    ln_qkv.output_quantizer_role = QuantizerRole(
+        module_type="dpa",
+        tensor_type="qkv",
+        name="self_attention.core_attention",
+    )
+
+    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+        qkv.init_fp8_metadata(num_gemms=1)
+        proj.init_fp8_metadata(num_gemms=1)
+        ln_qkv.init_fp8_metadata(num_gemms=1)
+
+    for module in (qkv, proj, ln_qkv):
+        weight_quantizer = module.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
+        assert weight_quantizer.with_amax_reduction
+        assert weight_quantizer.amax_reduction_group is tp_group
+
+    assert not qkv._nvfp4_row_parallel_fprop_fp32_reduce
+    assert proj._nvfp4_row_parallel_fprop_fp32_reduce
+
+
+@pytest.mark.skipif(not fp4_available, reason=reason_for_no_fp4)
+def test_nvfp4_row_scaled_sequence_parallel_input_keeps_rowwise_amax():
+    from transformer_engine.pytorch.constants import FP8FwdTensorIdx
+
+    nvfp4_recipe = NVFP4BlockScaling(row_scaled_activation=True)
+    tp_group = object()
+    module = Linear(
+        16,
+        16,
+        parallel_mode="column",
+        sequence_parallel=True,
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        name="mlp.fc1",
+    )
+    module.set_tensor_parallel_group(tp_group)
+
+    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+        module.init_fp8_metadata(num_gemms=1)
+
+    input_quantizer = module.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
+    assert input_quantizer.row_scaled_nvfp4
+    assert not input_quantizer.with_amax_reduction
+    assert input_quantizer.amax_reduction_group is None
+
+
+@pytest.mark.skipif(not fp4_available, reason=reason_for_no_fp4)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
 @pytest.mark.parametrize("row_scaled_nvfp4", [False, True], ids=["nvfp4", "nvfp4_row_scaled"])
 @pytest.mark.parametrize("use_4over6", [False, True], ids=["default", "4over6"])

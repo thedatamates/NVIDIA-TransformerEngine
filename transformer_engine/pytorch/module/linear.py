@@ -130,6 +130,7 @@ class LinearFwdArgs:
     tensor_parallel: bool
     sequence_parallel: bool
     symmetric_ar_type: Optional[str]
+    nvfp4_row_parallel_fprop_fp32_reduce: bool
     backward_input_needs_gather: bool
 
     # --- Userbuffers (comm + GEMM overlap) ---
@@ -401,7 +402,6 @@ def _linear_forward_impl(
     # ------------------------------------------------------
     new_weight_workspace = None
     weightmat = weight
-    fprop_only_weightmat = False
     if fp8 or debug:
         # Configure quantizer
         # No need to set the quantizer states if weight is already quantized
@@ -418,23 +418,6 @@ def _linear_forward_impl(
             weight_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
         elif isinstance(weight, QuantizedTensor):
             weight_quantizer = weight._quantizer
-        restore_weight_amax = None
-        fprop_weight_amax_group = getattr(
-            weight_quantizer,
-            "_nvfp4_weight_amax_reduction_group",
-            None,
-        )
-        if (
-            fprop_weight_amax_group is not None
-            and weight_quantizer is not None
-            and not isinstance(weight, (QuantizedTensor, QuantizedTensorStorage))
-        ):
-            restore_weight_amax = (
-                weight_quantizer.with_amax_reduction,
-                weight_quantizer.amax_reduction_group,
-            )
-            weight_quantizer.with_amax_reduction = True
-            weight_quantizer.amax_reduction_group = fprop_weight_amax_group
         # Get quantized weight
         update_ws = is_first_microbatch is None or is_first_microbatch
         weightmat, new_weight_workspace = quantize_weight(
@@ -447,10 +430,6 @@ def _linear_forward_impl(
             workspace_dtype=activation_dtype,
             cache=args.cache_weight,
         )
-        if restore_weight_amax is not None:
-            weight_quantizer.with_amax_reduction = restore_weight_amax[0]
-            weight_quantizer.amax_reduction_group = restore_weight_amax[1]
-            fprop_only_weightmat = True
         weightmat.update_usage(rowwise_usage=True)
 
     else:
@@ -496,28 +475,19 @@ def _linear_forward_impl(
     # Forward GEMM
     # Note: y = x * w^T
     # ------------------------------------------------------
-    gemm_inputmat_total = inputmat_total
-    gemm_weightmat = weightmat
-    gemm_output_quantizer = output_quantizer
     gemm_out_dtype = activation_dtype
     if (
         parallel_mode == "row"
         and args.tp_size > 1
-        and gemm_output_quantizer is None
-        and bool(
-            getattr(
-                weight_quantizer,
-                "_nvfp4_row_parallel_fprop_fp32_reduce",
-                False,
-            )
-        )
+        and output_quantizer is None
+        and args.nvfp4_row_parallel_fprop_fp32_reduce
     ):
         gemm_out_dtype = torch.float32
     nvtx_range_push(f"{nvtx_label}.gemm")
     gemm_out, *_, reduce_scatter_out = general_gemm(
-        gemm_weightmat,
-        gemm_inputmat_total,
-        quantization_params=gemm_output_quantizer,
+        weightmat,
+        inputmat_total,
+        quantization_params=output_quantizer,
         out_dtype=gemm_out_dtype,
         bias=bias,
         use_split_accumulator=use_split_accumulator,
@@ -603,9 +573,7 @@ def _linear_forward_impl(
         fsdp_shapes = _fsdp_scatter_tensors(
             fsdp_group,
             saved_inputmat,
-            weightmat
-            if fp8 and not isinstance(weight, QuantizedTensorStorage) and not fprop_only_weightmat
-            else None,
+            weightmat if fp8 and not isinstance(weight, QuantizedTensorStorage) else None,
         )
         nvtx_range_pop(f"{nvtx_label}.fsdp_scatter")
 
@@ -617,8 +585,6 @@ def _linear_forward_impl(
         # Backward will re-quantize from the FSDP2 all-gathered weight.
         # (Issue #2681)
         wt_save = weightmat
-        if fprop_only_weightmat:
-            wt_save = None
         if is_fsdp2 and weightmat is not weight:
             wt_save = None
 
@@ -979,29 +945,7 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
                     weight_fp8 = saved_weight
                 elif bwd_args.weight_quantizer is not None:
                     bwd_args.weight_quantizer.set_usage(rowwise=True, columnwise=True)
-                    restore_weight_amax = None
-                    bwd_weight_amax_group = getattr(
-                        bwd_args.weight_quantizer,
-                        "_nvfp4_weight_amax_reduction_group",
-                        None,
-                    )
-                    if bwd_weight_amax_group is not None:
-                        restore_weight_amax = (
-                            bwd_args.weight_quantizer.with_amax_reduction,
-                            bwd_args.weight_quantizer.amax_reduction_group,
-                        )
-                        bwd_args.weight_quantizer.with_amax_reduction = True
-                        bwd_args.weight_quantizer.amax_reduction_group = (
-                            bwd_weight_amax_group
-                        )
                     weight_fp8 = bwd_args.weight_quantizer(saved_weight)
-                    if restore_weight_amax is not None:
-                        bwd_args.weight_quantizer.with_amax_reduction = (
-                            restore_weight_amax[0]
-                        )
-                        bwd_args.weight_quantizer.amax_reduction_group = (
-                            restore_weight_amax[1]
-                        )
 
             # Make sure required data is available
             if isinstance(grad_output, QuantizedTensorStorage):
@@ -1553,6 +1497,7 @@ class Linear(TransformerEngineBaseModule):
             self.in_features = divide(self.in_features, self.tp_size)
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
+        self._nvfp4_row_parallel_fprop_fp32_reduce = False
 
         # Column parallel TP overlap options
         self.ub_overlap_ag_fprop = (
@@ -1875,8 +1820,10 @@ class Linear(TransformerEngineBaseModule):
             )
 
             if self.fp8:
-                backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
+                fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                backward_override = fp8_recipe.backward_override
             else:
+                fp8_recipe = None
                 backward_override = None
             custom = is_custom(input_quantizer) or is_custom(weight_quantizer)
             backward_input_needs_gather = (
@@ -1943,6 +1890,11 @@ class Linear(TransformerEngineBaseModule):
                 tensor_parallel=self.tp_size > 1,
                 sequence_parallel=self.sequence_parallel,
                 symmetric_ar_type=self.symmetric_ar_type,
+                nvfp4_row_parallel_fprop_fp32_reduce=(
+                    self._nvfp4_row_parallel_fprop_fp32_reduce
+                    and fp8_recipe is not None
+                    and fp8_recipe.nvfp4()
+                ),
                 backward_input_needs_gather=backward_input_needs_gather,
                 # userbuffers
                 ub_name=self.ub_name,
@@ -2152,7 +2104,7 @@ class Linear(TransformerEngineBaseModule):
                 ].amax_reduction_group = self.tp_group
 
     def _customize_quantizers_nvfp4(self, fwd: bool, recipe: Recipe) -> None:
-        """Customize quantizers based on current scaling recipe + linear."""
+        """Customize quantizers based on NVFP4 block scaling recipe + linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
             output_role = getattr(self, "_output_quantizer_role", None)
@@ -2160,6 +2112,8 @@ class Linear(TransformerEngineBaseModule):
             output_role_tensor = getattr(output_role, "tensor_type", None)
             name = self.name or ""
             is_attention_qkv = output_role_module == "dpa" and output_role_tensor == "qkv"
+            # QKV is identified by its boundary role. Projection owns the
+            # consumer-side input quantizer, so it follows MHA's module name.
             is_attention_proj = name in {"proj", "attn_proj"} or name.endswith(".proj")
             if (
                 (is_attention_qkv or is_attention_proj)
@@ -2167,21 +2121,18 @@ class Linear(TransformerEngineBaseModule):
                 and self.parallel_mode in ("column", "row")
             ):
                 weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
-                weight_quantizer._nvfp4_weight_amax_reduction_group = self.tp_group
+                weight_quantizer.with_amax_reduction = True
+                weight_quantizer.amax_reduction_group = self.tp_group
             if (
                 is_attention_proj
                 and self.tp_size > 1
                 and self.parallel_mode == "row"
             ):
-                weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
-                weight_quantizer._nvfp4_row_parallel_fprop_fp32_reduce = True
+                self._nvfp4_row_parallel_fprop_fp32_reduce = True
             if self.sequence_parallel and self.parallel_mode == "column":
                 # customize input_quantizer with amax reduction TP group
                 input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
-                if (
-                    not getattr(input_quantizer, "row_scaled_nvfp4", False)
-                    and not input_quantizer.with_amax_reduction
-                ):
+                if not getattr(input_quantizer, "row_scaled_nvfp4", False):
                     input_quantizer.with_amax_reduction = True
                     input_quantizer.amax_reduction_group = self.tp_group
         else:
@@ -2190,9 +2141,8 @@ class Linear(TransformerEngineBaseModule):
                 grad_output_quantizer = self.quantizers["scaling_bwd"][
                     FP8BwdTensorIdx.GRAD_OUTPUT1
                 ]
-                if not grad_output_quantizer.with_amax_reduction:
-                    grad_output_quantizer.with_amax_reduction = True
-                    grad_output_quantizer.amax_reduction_group = self.tp_group
+                grad_output_quantizer.with_amax_reduction = True
+                grad_output_quantizer.amax_reduction_group = self.tp_group
 
     def _get_weight_quantizers(self) -> List[Quantizer]:
         """Get the weight quantizers of the module."""

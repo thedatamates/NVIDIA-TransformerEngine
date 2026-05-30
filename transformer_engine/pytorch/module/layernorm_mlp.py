@@ -2646,7 +2646,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 ].amax_reduction_group = self.tp_group
 
     def _customize_quantizers_nvfp4(self, fwd: bool, recipe: Recipe) -> None:
-        """Customize quantizers based on current scaling recipe + layernorm_mlp."""
+        """Customize quantizers based on NVFP4 block scaling recipe + layernorm_mlp."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
             if self.sequence_parallel and self.set_parallel_mode:
