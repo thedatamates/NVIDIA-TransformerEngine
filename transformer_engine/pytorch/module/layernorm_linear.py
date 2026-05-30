@@ -320,7 +320,7 @@ class _LayerNormLinear(torch.autograd.Function):
             restore_weight_amax = None
             fprop_weight_amax_group = getattr(
                 weight_quantizer,
-                "_force_fprop_amax_reduction_group",
+                "_nvfp4_weight_amax_reduction_group",
                 None,
             )
             if (
@@ -795,7 +795,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     restore_weight_amax = None
                     bwd_weight_amax_group = getattr(
                         ctx.weight_quantizer,
-                        "_force_fprop_amax_reduction_group",
+                        "_nvfp4_weight_amax_reduction_group",
                         None,
                     )
                     if bwd_weight_amax_group is not None:
@@ -1944,14 +1944,14 @@ class LayerNormLinear(TransformerEngineBaseModule):
         """Customize quantizers based on current scaling recipe + layernorm_linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
-            role = getattr(self, "_force_te_weight_amax_role", "")
+            role = getattr(self, "_nvfp4_tp_scaling_role", "")
             if (
                 role in {"qkv", "attn_proj"}
                 and self.tp_size > 1
                 and self.parallel_mode in ("column", "row")
             ):
                 weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
-                weight_quantizer._force_fprop_amax_reduction_group = self.tp_group
+                weight_quantizer._nvfp4_weight_amax_reduction_group = self.tp_group
             if self.sequence_parallel and self.parallel_mode == "column":
                 # set input_quantizer with amax reduction TP group
                 input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]

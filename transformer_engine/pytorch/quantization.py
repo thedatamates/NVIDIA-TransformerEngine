@@ -1696,11 +1696,7 @@ class NVFP4BlockScalingRecipeState(RecipeState):
             reduce_amax = (
                 amax_reduction_group is not None
                 and tensor_type != "weight"
-                and (
-                    not row_scaled_nvfp4
-                    or os.environ.get("NVTE_FORCE_ROW_SCALED_NVFP4_AMAX_REDUCTION")
-                    == "1"
-                )
+                and not row_scaled_nvfp4
             )
             return NVFP4Quantizer(
                 fp4_dtype=self.dtype,

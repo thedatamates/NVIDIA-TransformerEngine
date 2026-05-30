@@ -421,7 +421,7 @@ def _linear_forward_impl(
         restore_weight_amax = None
         fprop_weight_amax_group = getattr(
             weight_quantizer,
-            "_force_fprop_amax_reduction_group",
+            "_nvfp4_weight_amax_reduction_group",
             None,
         )
         if (
@@ -507,7 +507,7 @@ def _linear_forward_impl(
         and bool(
             getattr(
                 weight_quantizer,
-                "_force_row_parallel_fprop_fp32_reduce",
+                "_nvfp4_row_parallel_fprop_fp32_reduce",
                 False,
             )
         )
@@ -982,7 +982,7 @@ def _linear_backward(args: LinearBwdArgs) -> Tuple[Union[torch.Tensor, None], ..
                     restore_weight_amax = None
                     bwd_weight_amax_group = getattr(
                         bwd_args.weight_quantizer,
-                        "_force_fprop_amax_reduction_group",
+                        "_nvfp4_weight_amax_reduction_group",
                         None,
                     )
                     if bwd_weight_amax_group is not None:
@@ -2155,21 +2155,21 @@ class Linear(TransformerEngineBaseModule):
         """Customize quantizers based on current scaling recipe + linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
-            role = getattr(self, "_force_te_weight_amax_role", "")
+            role = getattr(self, "_nvfp4_tp_scaling_role", "")
             if (
                 role in {"qkv", "attn_proj"}
                 and self.tp_size > 1
                 and self.parallel_mode in ("column", "row")
             ):
                 weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
-                weight_quantizer._force_fprop_amax_reduction_group = self.tp_group
+                weight_quantizer._nvfp4_weight_amax_reduction_group = self.tp_group
             if (
                 role == "attn_proj"
                 and self.tp_size > 1
                 and self.parallel_mode == "row"
             ):
                 weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
-                weight_quantizer._force_row_parallel_fprop_fp32_reduce = True
+                weight_quantizer._nvfp4_row_parallel_fprop_fp32_reduce = True
             if self.sequence_parallel and self.parallel_mode == "column":
                 # customize input_quantizer with amax reduction TP group
                 input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
