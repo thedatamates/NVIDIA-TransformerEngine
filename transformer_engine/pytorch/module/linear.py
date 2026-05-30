@@ -2155,16 +2155,21 @@ class Linear(TransformerEngineBaseModule):
         """Customize quantizers based on current scaling recipe + linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
-            role = getattr(self, "_nvfp4_tp_scaling_role", "")
+            output_role = getattr(self, "_output_quantizer_role", None)
+            output_role_module = getattr(output_role, "module_type", None)
+            output_role_tensor = getattr(output_role, "tensor_type", None)
+            name = self.name or ""
+            is_attention_qkv = output_role_module == "dpa" and output_role_tensor == "qkv"
+            is_attention_proj = name in {"proj", "attn_proj"} or name.endswith(".proj")
             if (
-                role in {"qkv", "attn_proj"}
+                (is_attention_qkv or is_attention_proj)
                 and self.tp_size > 1
                 and self.parallel_mode in ("column", "row")
             ):
                 weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
                 weight_quantizer._nvfp4_weight_amax_reduction_group = self.tp_group
             if (
-                role == "attn_proj"
+                is_attention_proj
                 and self.tp_size > 1
                 and self.parallel_mode == "row"
             ):

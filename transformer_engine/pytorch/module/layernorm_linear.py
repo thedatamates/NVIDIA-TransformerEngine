@@ -1944,9 +1944,13 @@ class LayerNormLinear(TransformerEngineBaseModule):
         """Customize quantizers based on current scaling recipe + layernorm_linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
-            role = getattr(self, "_nvfp4_tp_scaling_role", "")
+            output_role = getattr(self, "_output_quantizer_role", None)
+            is_attention_qkv = (
+                getattr(output_role, "module_type", None) == "dpa"
+                and getattr(output_role, "tensor_type", None) == "qkv"
+            )
             if (
-                role in {"qkv", "attn_proj"}
+                is_attention_qkv
                 and self.tp_size > 1
                 and self.parallel_mode in ("column", "row")
             ):
