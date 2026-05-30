@@ -1497,6 +1497,7 @@ class Linear(TransformerEngineBaseModule):
             self.in_features = divide(self.in_features, self.tp_size)
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
+        self._is_attention_projection = False
         self._nvfp4_row_parallel_fprop_fp32_reduce = False
 
         # Column parallel TP overlap options
@@ -2110,11 +2111,8 @@ class Linear(TransformerEngineBaseModule):
             output_role = getattr(self, "_output_quantizer_role", None)
             output_role_module = getattr(output_role, "module_type", None)
             output_role_tensor = getattr(output_role, "tensor_type", None)
-            name = self.name or ""
             is_attention_qkv = output_role_module == "dpa" and output_role_tensor == "qkv"
-            # QKV is identified by its boundary role. Projection owns the
-            # consumer-side input quantizer, so it follows MHA's module name.
-            is_attention_proj = name in {"proj", "attn_proj"} or name.endswith(".proj")
+            is_attention_proj = getattr(self, "_is_attention_projection", False)
             if (
                 (is_attention_qkv or is_attention_proj)
                 and self.tp_size > 1

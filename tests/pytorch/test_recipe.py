@@ -673,9 +673,21 @@ def test_nvfp4_attention_tp_quantizer_customization():
         tp_size=2,
         params_dtype=torch.bfloat16,
         device="cuda",
-        name="self_attention.proj",
+        name="self_attention.output",
     )
     proj.set_tensor_parallel_group(tp_group)
+    proj._is_attention_projection = True
+
+    non_attention_proj_named = Linear(
+        16,
+        16,
+        parallel_mode="row",
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        name="mlp.proj",
+    )
+    non_attention_proj_named.set_tensor_parallel_group(tp_group)
 
     ln_qkv = LayerNormLinear(
         16,
@@ -696,6 +708,7 @@ def test_nvfp4_attention_tp_quantizer_customization():
     with te.autocast(enabled=True, recipe=nvfp4_recipe):
         qkv.init_fp8_metadata(num_gemms=1)
         proj.init_fp8_metadata(num_gemms=1)
+        non_attention_proj_named.init_fp8_metadata(num_gemms=1)
         ln_qkv.init_fp8_metadata(num_gemms=1)
 
     for module in (qkv, proj, ln_qkv):
@@ -703,8 +716,14 @@ def test_nvfp4_attention_tp_quantizer_customization():
         assert weight_quantizer.with_amax_reduction
         assert weight_quantizer.amax_reduction_group is tp_group
 
+    non_attention_weight_quantizer = non_attention_proj_named.quantizers["scaling_fwd"][
+        FP8FwdTensorIdx.GEMM1_WEIGHT
+    ]
+    assert not non_attention_weight_quantizer.with_amax_reduction
+    assert non_attention_weight_quantizer.amax_reduction_group is None
     assert not qkv._nvfp4_row_parallel_fprop_fp32_reduce
     assert proj._nvfp4_row_parallel_fprop_fp32_reduce
+    assert not non_attention_proj_named._nvfp4_row_parallel_fprop_fp32_reduce
 
 
 @pytest.mark.skipif(not fp4_available, reason=reason_for_no_fp4)

@@ -478,6 +478,7 @@ class MultiheadAttention(torch.nn.Module):
             name=name + ".proj" if name is not None else None,
             **common_gemm_kwargs,
         )
+        self.proj._is_attention_projection = True
 
     def _update_output_quantizer_roles(
         self,
