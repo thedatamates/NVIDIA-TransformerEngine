@@ -644,13 +644,39 @@ def test_nvfp4_row_scaled_quantizer_roles(
 
 
 @pytest.mark.skipif(not fp4_available, reason=reason_for_no_fp4)
-def test_nvfp4_attention_tp_quantizer_customization():
+def test_nvfp4_tp_weight_amax_reduction_policy(monkeypatch):
     from transformer_engine.pytorch.constants import FP8FwdTensorIdx
 
     nvfp4_recipe = NVFP4BlockScaling()
     tp_group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
 
-    qkv = Linear(
+    explicit_column_linear = Linear(
+        16,
+        48,
+        parallel_mode="column",
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        name="mlp.fc1",
+        with_tp_weight_amax_reduction=True,
+    )
+    explicit_column_linear.set_tensor_parallel_group(tp_group)
+
+    explicit_row_linear = Linear(
+        16,
+        16,
+        parallel_mode="row",
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        name="mlp.proj",
+        with_tp_weight_amax_reduction=True,
+        row_parallel_fprop_reduce_dtype=torch.float32,
+    )
+    explicit_row_linear.set_tensor_parallel_group(tp_group)
+
+    role_decoy = Linear(
         16,
         48,
         parallel_mode="column",
@@ -659,26 +685,26 @@ def test_nvfp4_attention_tp_quantizer_customization():
         device="cuda",
         name="self_attention.qkv",
     )
-    qkv.set_tensor_parallel_group(tp_group)
-    qkv.output_quantizer_role = QuantizerRole(
+    role_decoy.set_tensor_parallel_group(tp_group)
+    role_decoy.output_quantizer_role = QuantizerRole(
         module_type="dpa",
         tensor_type="qkv",
         name="self_attention.core_attention",
     )
 
-    proj = Linear(
+    explicit_ln_linear = LayerNormLinear(
         16,
-        16,
-        parallel_mode="row",
+        48,
+        parallel_mode="column",
         tp_size=2,
         params_dtype=torch.bfloat16,
         device="cuda",
-        name="self_attention.output",
+        name="mlp.layernorm_fc1",
+        with_tp_weight_amax_reduction=True,
     )
-    proj.set_tensor_parallel_group(tp_group)
-    proj._is_attention_projection = True
+    explicit_ln_linear.set_tensor_parallel_group(tp_group)
 
-    non_attention_proj_named = Linear(
+    decoy_linear = Linear(
         16,
         16,
         parallel_mode="row",
@@ -687,43 +713,77 @@ def test_nvfp4_attention_tp_quantizer_customization():
         device="cuda",
         name="mlp.proj",
     )
-    non_attention_proj_named.set_tensor_parallel_group(tp_group)
+    decoy_linear.set_tensor_parallel_group(tp_group)
 
-    ln_qkv = LayerNormLinear(
+    late_opt_in_linear = Linear(
         16,
         48,
         parallel_mode="column",
         tp_size=2,
         params_dtype=torch.bfloat16,
         device="cuda",
-        name="self_attention.layernorm_qkv",
+        name="self_attention.late_qkv",
     )
-    ln_qkv.set_tensor_parallel_group(tp_group)
-    ln_qkv.output_quantizer_role = QuantizerRole(
-        module_type="dpa",
-        tensor_type="qkv",
-        name="self_attention.core_attention",
+    late_opt_in_linear.set_tensor_parallel_group(tp_group)
+
+    mha = te.MultiheadAttention(
+        hidden_size=16,
+        num_attention_heads=2,
+        attention_dropout=0.0,
+        set_parallel_mode=True,
+        tp_size=2,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+        bias=False,
+        name="self_attention",
     )
+    mha.qkv.set_tensor_parallel_group(tp_group)
+    mha.proj.set_tensor_parallel_group(tp_group)
 
     with te.autocast(enabled=True, recipe=nvfp4_recipe):
-        qkv.init_fp8_metadata(num_gemms=1)
-        proj.init_fp8_metadata(num_gemms=1)
-        non_attention_proj_named.init_fp8_metadata(num_gemms=1)
-        ln_qkv.init_fp8_metadata(num_gemms=1)
+        explicit_column_linear.init_fp8_metadata(num_gemms=1)
+        explicit_row_linear.init_fp8_metadata(num_gemms=1)
+        role_decoy.init_fp8_metadata(num_gemms=1)
+        explicit_ln_linear.init_fp8_metadata(num_gemms=1)
+        decoy_linear.init_fp8_metadata(num_gemms=1)
+        late_opt_in_linear.init_fp8_metadata(num_gemms=1)
+        mha.qkv.init_fp8_metadata(num_gemms=1)
+        mha.proj.init_fp8_metadata(num_gemms=1)
 
-    for module in (qkv, proj, ln_qkv):
+    late_weight_quantizer = late_opt_in_linear.quantizers["scaling_fwd"][
+        FP8FwdTensorIdx.GEMM1_WEIGHT
+    ]
+    assert not late_weight_quantizer.with_amax_reduction
+    late_opt_in_linear.with_tp_weight_amax_reduction = True
+    with te.autocast(enabled=True, recipe=nvfp4_recipe):
+        late_opt_in_linear.init_fp8_metadata(num_gemms=1)
+
+    for module in (
+        explicit_column_linear,
+        explicit_row_linear,
+        explicit_ln_linear,
+        late_opt_in_linear,
+        mha.qkv,
+        mha.proj,
+    ):
         weight_quantizer = module.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
         assert weight_quantizer.with_amax_reduction
         assert weight_quantizer.amax_reduction_group is tp_group
 
-    non_attention_weight_quantizer = non_attention_proj_named.quantizers["scaling_fwd"][
+    assert explicit_row_linear.row_parallel_fprop_reduce_dtype is torch.float32
+
+    decoy_weight_quantizer = decoy_linear.quantizers["scaling_fwd"][
         FP8FwdTensorIdx.GEMM1_WEIGHT
     ]
-    assert not non_attention_weight_quantizer.with_amax_reduction
-    assert non_attention_weight_quantizer.amax_reduction_group is None
-    assert not qkv._nvfp4_row_parallel_fprop_fp32_reduce
-    assert proj._nvfp4_row_parallel_fprop_fp32_reduce
-    assert not non_attention_proj_named._nvfp4_row_parallel_fprop_fp32_reduce
+    assert not decoy_weight_quantizer.with_amax_reduction
+    assert decoy_weight_quantizer.amax_reduction_group is None
+    assert decoy_linear.row_parallel_fprop_reduce_dtype is None
+
+    role_decoy_weight_quantizer = role_decoy.quantizers["scaling_fwd"][
+        FP8FwdTensorIdx.GEMM1_WEIGHT
+    ]
+    assert not role_decoy_weight_quantizer.with_amax_reduction
+    assert role_decoy_weight_quantizer.amax_reduction_group is None
 
 
 @pytest.mark.skipif(not fp4_available, reason=reason_for_no_fp4)

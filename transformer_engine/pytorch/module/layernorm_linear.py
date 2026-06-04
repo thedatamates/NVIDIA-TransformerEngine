@@ -1215,6 +1215,9 @@ class LayerNormLinear(TransformerEngineBaseModule):
                    This can help in latency bound communication situations.
                    Requires PyTorch version 2.7.0 or higher. When set to ``None``, standard all-reduce
                    is used.
+    with_tp_weight_amax_reduction : bool, default = False
+                       If set, reduce the NVFP4 runtime weight amax across the tensor-parallel
+                       group for column/row tensor-parallel weights.
     """
 
     def __init__(
@@ -1247,6 +1250,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
         delay_wgrad_compute: bool = False,
         symmetric_ar_type: Optional[str] = None,
         name: Optional[str] = None,
+        with_tp_weight_amax_reduction: bool = False,
     ) -> None:
         super().__init__(name)
 
@@ -1265,6 +1269,8 @@ class LayerNormLinear(TransformerEngineBaseModule):
         )
         self.zero_centered_gamma = zero_centered_gamma
         self.symmetric_ar_type = symmetric_ar_type
+        self._with_tp_weight_amax_reduction = False
+        self.with_tp_weight_amax_reduction = with_tp_weight_amax_reduction
 
         self.wgrad_store = WeightGradStore(delay_wgrad_compute, ub_bulk_wgrad)
 
@@ -1492,6 +1498,23 @@ class LayerNormLinear(TransformerEngineBaseModule):
             for name, param in self.named_parameters():
                 if name in self.weight_names or name in self.bias_names:
                     param.skip_backward_post_hook = True
+
+    @property
+    def with_tp_weight_amax_reduction(self) -> bool:
+        """Whether NVFP4 TP-sharded runtime weight quantization reduces amax."""
+
+        return self._with_tp_weight_amax_reduction
+
+    @with_tp_weight_amax_reduction.setter
+    def with_tp_weight_amax_reduction(self, value: bool) -> None:
+        value = bool(value)
+        if value == getattr(self, "_with_tp_weight_amax_reduction", False):
+            return
+        self._with_tp_weight_amax_reduction = value
+        if getattr(self, "fp8_initialized", False):
+            self.fp8_initialized = False
+        if getattr(self, "fp8_meta_tensors_initialized", False):
+            self.fp8_meta_tensors_initialized = False
 
     def set_meta_tensor(self, fwd: bool, recipe: Recipe) -> None:
         """Init scales and amaxes for fwd | bwd."""
@@ -1899,13 +1922,8 @@ class LayerNormLinear(TransformerEngineBaseModule):
         """Customize quantizers based on NVFP4 block scaling recipe + layernorm_linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
-            output_role = getattr(self, "_output_quantizer_role", None)
-            is_attention_qkv = (
-                getattr(output_role, "module_type", None) == "dpa"
-                and getattr(output_role, "tensor_type", None) == "qkv"
-            )
             if (
-                is_attention_qkv
+                self.with_tp_weight_amax_reduction
                 and self.tp_size > 1
                 and self.parallel_mode in ("column", "row")
             ):

@@ -389,6 +389,7 @@ class MultiheadAttention(torch.nn.Module):
                     normalization=normalization,
                     ub_name="qkv",
                     name=name + ".layernorm_linear_qkv" if name is not None else None,
+                    with_tp_weight_amax_reduction=True,
                     **common_gemm_kwargs,
                 )
             else:
@@ -401,6 +402,7 @@ class MultiheadAttention(torch.nn.Module):
                     parallel_mode=qkv_parallel_mode,
                     parameters_split=parameters_split,
                     name=name + ".linear_qkv" if name is not None else None,
+                    with_tp_weight_amax_reduction=True,
                     **common_gemm_kwargs,
                 )
         elif self.attention_type == "cross":
@@ -423,6 +425,7 @@ class MultiheadAttention(torch.nn.Module):
                     normalization=normalization,
                     ub_name="qkv",
                     name=name + ".layernorm_linear_q" if name is not None else None,
+                    with_tp_weight_amax_reduction=True,
                     **common_gemm_kwargs,
                 )
             else:
@@ -433,6 +436,7 @@ class MultiheadAttention(torch.nn.Module):
                     bias=bias,
                     return_bias=False,
                     parallel_mode=qkv_parallel_mode,
+                    with_tp_weight_amax_reduction=True,
                     **common_gemm_kwargs,
                 )
             self.key_value = Linear(
@@ -444,6 +448,7 @@ class MultiheadAttention(torch.nn.Module):
                 parallel_mode=qkv_parallel_mode,
                 parameters_split=("key", "value") if not fuse_qkv_params else None,
                 name=name + ".linear_kv" if name is not None else None,
+                with_tp_weight_amax_reduction=True,
                 **common_gemm_kwargs,
             )
 
@@ -476,9 +481,10 @@ class MultiheadAttention(torch.nn.Module):
             ub_overlap_ag=ub_overlap_ag,
             ub_name="proj",
             name=name + ".proj" if name is not None else None,
+            with_tp_weight_amax_reduction=True,
+            row_parallel_fprop_reduce_dtype=torch.float32,
             **common_gemm_kwargs,
         )
-        self.proj._is_attention_projection = True
 
     def _update_output_quantizer_roles(
         self,

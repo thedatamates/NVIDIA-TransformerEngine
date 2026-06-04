@@ -65,6 +65,36 @@ from ...debug.pytorch.debug_state import TEDebugState
 
 __all__ = ["GroupedLinear"]
 
+_NVFP4_GROUP_HADAMARD_MAX_TENSORS = 64
+
+
+def _split_quantize_with_group_hadamard_limit(
+    tensor: torch.Tensor,
+    split_sections: List[int],
+    quantizers: List[Optional[Quantizer]],
+    **kwargs,
+) -> list:
+    """Run split_quantize in chunks that satisfy the NVFP4 Hadamard tensor cap."""
+    if len(split_sections) <= _NVFP4_GROUP_HADAMARD_MAX_TENSORS:
+        return tex.split_quantize(tensor, split_sections, quantizers, **kwargs)
+    outputs = []
+    offset = 0
+    for start in range(0, len(split_sections), _NVFP4_GROUP_HADAMARD_MAX_TENSORS):
+        end = min(start + _NVFP4_GROUP_HADAMARD_MAX_TENSORS, len(split_sections))
+        chunk_sections = split_sections[start:end]
+        chunk_rows = sum(chunk_sections)
+        chunk_tensor = tensor.narrow(0, offset, chunk_rows)
+        outputs.extend(
+            tex.split_quantize(
+                chunk_tensor,
+                chunk_sections,
+                quantizers[start:end],
+                **kwargs,
+            )
+        )
+        offset += chunk_rows
+    return outputs
+
 
 class _GroupedLinear(torch.autograd.Function):
     """GroupedLinear semi-top level module
@@ -524,7 +554,7 @@ class _GroupedLinear(torch.autograd.Function):
             # Disable bulk allocation when CPU offloading is active: offloading skips small
             # tensors (like scales), but bulk allocation shares storage across all tensors,
             # so if scales can't be offloaded, nothing in the group can be offloaded.
-            inputmats = tex.split_quantize(
+            inputmats = _split_quantize_with_group_hadamard_limit(
                 inp_view,
                 m_splits,
                 input_quantizers,
@@ -946,14 +976,14 @@ class _GroupedLinear(torch.autograd.Function):
                         # Unfused bias grad and multi-tensor quantize
                         for i in range(ctx.num_gemms):
                             grad_biases[i] = grad_output_mats[i].sum(dim=0)
-                        grad_output = tex.split_quantize(
+                        grad_output = _split_quantize_with_group_hadamard_limit(
                             grad_output_view,
                             ctx.m_splits,
                             ctx.grad_output_quantizers,
                         )
                 else:
                     # Multi-tensor quantize
-                    grad_output = tex.split_quantize(
+                    grad_output = _split_quantize_with_group_hadamard_limit(
                         grad_output_view,
                         ctx.m_splits,
                         ctx.grad_output_quantizers,
@@ -1067,7 +1097,9 @@ class _GroupedLinear(torch.autograd.Function):
                                 input_quantizer.set_usage(rowwise=False, columnwise=True)
                     inputmats: list
                     if ctx.fp8 and not ctx.debug:
-                        inputmats = tex.split_quantize(inp_view, ctx.m_splits, ctx.input_quantizers)
+                        inputmats = _split_quantize_with_group_hadamard_limit(
+                            inp_view, ctx.m_splits, ctx.input_quantizers
+                        )
                     elif ctx.debug:
                         inputmats = DebugQuantizer.multi_tensor_quantize(
                             inp_view,

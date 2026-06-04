@@ -130,7 +130,7 @@ class LinearFwdArgs:
     tensor_parallel: bool
     sequence_parallel: bool
     symmetric_ar_type: Optional[str]
-    nvfp4_row_parallel_fprop_fp32_reduce: bool
+    row_parallel_fprop_reduce_dtype: Optional[torch.dtype]
     backward_input_needs_gather: bool
 
     # --- Userbuffers (comm + GEMM overlap) ---
@@ -476,13 +476,9 @@ def _linear_forward_impl(
     # Note: y = x * w^T
     # ------------------------------------------------------
     gemm_out_dtype = activation_dtype
-    if (
-        parallel_mode == "row"
-        and args.tp_size > 1
-        and output_quantizer is None
-        and args.nvfp4_row_parallel_fprop_fp32_reduce
-    ):
-        gemm_out_dtype = torch.float32
+    row_parallel_reduce_dtype = args.row_parallel_fprop_reduce_dtype
+    if parallel_mode == "row" and args.tp_size > 1 and output_quantizer is None:
+        gemm_out_dtype = row_parallel_reduce_dtype or gemm_out_dtype
     nvtx_range_push(f"{nvtx_label}.gemm")
     gemm_out, *_, reduce_scatter_out = general_gemm(
         weightmat,
@@ -1429,6 +1425,13 @@ class Linear(TransformerEngineBaseModule):
                        cast tensor. In some scenarios, the input tensor is used by multiple modules,
                        and saving the original input tensor may reduce the memory usage.
                        Cannot work with FP8 DelayedScaling recipe.
+    with_tp_weight_amax_reduction : bool, default = False
+                       If set, reduce the NVFP4 runtime weight amax across the tensor-parallel
+                       group for column/row tensor-parallel weights.
+    row_parallel_fprop_reduce_dtype : torch.dtype, default = None
+                       If set for row-parallel tensor parallelism under NVFP4 autocast, compute the
+                       forward GEMM output in this dtype before the tensor-parallel reduction when
+                       the output is not quantized.
     """
 
     def __init__(
@@ -1458,6 +1461,8 @@ class Linear(TransformerEngineBaseModule):
         symmetric_ar_type: Optional[str] = None,
         save_original_input: bool = False,
         name: Optional[str] = None,
+        with_tp_weight_amax_reduction: bool = False,
+        row_parallel_fprop_reduce_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__(name)
 
@@ -1497,8 +1502,9 @@ class Linear(TransformerEngineBaseModule):
             self.in_features = divide(self.in_features, self.tp_size)
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
-        self._is_attention_projection = False
-        self._nvfp4_row_parallel_fprop_fp32_reduce = False
+        self._with_tp_weight_amax_reduction = False
+        self.with_tp_weight_amax_reduction = with_tp_weight_amax_reduction
+        self.row_parallel_fprop_reduce_dtype = row_parallel_fprop_reduce_dtype
 
         # Column parallel TP overlap options
         self.ub_overlap_ag_fprop = (
@@ -1670,6 +1676,23 @@ class Linear(TransformerEngineBaseModule):
             for name, param in self.named_parameters():
                 if name in self.weight_names or name in self.bias_names:
                     param.skip_backward_post_hook = True
+
+    @property
+    def with_tp_weight_amax_reduction(self) -> bool:
+        """Whether NVFP4 TP-sharded runtime weight quantization reduces amax."""
+
+        return self._with_tp_weight_amax_reduction
+
+    @with_tp_weight_amax_reduction.setter
+    def with_tp_weight_amax_reduction(self, value: bool) -> None:
+        value = bool(value)
+        if value == getattr(self, "_with_tp_weight_amax_reduction", False):
+            return
+        self._with_tp_weight_amax_reduction = value
+        if getattr(self, "fp8_initialized", False):
+            self.fp8_initialized = False
+        if getattr(self, "fp8_meta_tensors_initialized", False):
+            self.fp8_meta_tensors_initialized = False
 
     def get_quantizer_roles(
         self,
@@ -1891,10 +1914,10 @@ class Linear(TransformerEngineBaseModule):
                 tensor_parallel=self.tp_size > 1,
                 sequence_parallel=self.sequence_parallel,
                 symmetric_ar_type=self.symmetric_ar_type,
-                nvfp4_row_parallel_fprop_fp32_reduce=(
-                    self._nvfp4_row_parallel_fprop_fp32_reduce
-                    and fp8_recipe is not None
-                    and fp8_recipe.nvfp4()
+                row_parallel_fprop_reduce_dtype=(
+                    self.row_parallel_fprop_reduce_dtype
+                    if fp8_recipe is not None and fp8_recipe.nvfp4()
+                    else None
                 ),
                 backward_input_needs_gather=backward_input_needs_gather,
                 # userbuffers
@@ -2108,25 +2131,14 @@ class Linear(TransformerEngineBaseModule):
         """Customize quantizers based on NVFP4 block scaling recipe + linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
         if fwd:
-            output_role = getattr(self, "_output_quantizer_role", None)
-            output_role_module = getattr(output_role, "module_type", None)
-            output_role_tensor = getattr(output_role, "tensor_type", None)
-            is_attention_qkv = output_role_module == "dpa" and output_role_tensor == "qkv"
-            is_attention_proj = getattr(self, "_is_attention_projection", False)
             if (
-                (is_attention_qkv or is_attention_proj)
+                self.with_tp_weight_amax_reduction
                 and self.tp_size > 1
                 and self.parallel_mode in ("column", "row")
             ):
                 weight_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_WEIGHT]
                 weight_quantizer.with_amax_reduction = True
                 weight_quantizer.amax_reduction_group = self.tp_group
-            if (
-                is_attention_proj
-                and self.tp_size > 1
-                and self.parallel_mode == "row"
-            ):
-                self._nvfp4_row_parallel_fprop_fp32_reduce = True
             if self.sequence_parallel and self.parallel_mode == "column":
                 # customize input_quantizer with amax reduction TP group
                 input_quantizer = self.quantizers["scaling_fwd"][FP8FwdTensorIdx.GEMM1_INPUT]
